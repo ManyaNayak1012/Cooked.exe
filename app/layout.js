@@ -3,6 +3,14 @@ import "./globals.css";
 export const metadata = {
   title: "ROAST.EXE",
   description: "Feed it a selfie or your Spotify. It finds the ammunition.",
+  icons: {
+    icon: [
+      { url: "/icon.png", type: "image/png" },
+      { url: "/favicon.ico" },
+    ],
+    shortcut: "/icon.png",
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({ children }) {
