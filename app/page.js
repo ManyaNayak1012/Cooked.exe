@@ -34,20 +34,47 @@ const DUO_SCAN = [
 ];
 
 async function normalizeImage(file) {
-  if (SUPPORTED_TYPES.includes(file.type) && file.size <= 6 * 1024 * 1024) return file;
   try {
-    const bitmap = await createImageBitmap(file);
-    const maxDim = 1600;
-    const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+    let sourceWidth, sourceHeight, drawSource;
+    if (typeof createImageBitmap === "function") {
+      const bitmap = await createImageBitmap(file);
+      sourceWidth = bitmap.width;
+      sourceHeight = bitmap.height;
+      drawSource = bitmap;
+    } else {
+      const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = objectUrl;
+      });
+      URL.revokeObjectURL(objectUrl);
+      sourceWidth = img.naturalWidth || img.width;
+      sourceHeight = img.naturalHeight || img.height;
+      drawSource = img;
+    }
+
+    const maxDim = 800;
+    const scale = Math.min(1, maxDim / Math.max(sourceWidth, sourceHeight));
     const canvas = document.createElement("canvas");
-    canvas.width = Math.round(bitmap.width * scale);
-    canvas.height = Math.round(bitmap.height * scale);
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
     const ctx = canvas.getContext("2d");
-    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.88));
+    ctx.drawImage(drawSource, 0, 0, canvas.width, canvas.height);
+    if (typeof drawSource.close === "function") {
+      drawSource.close();
+    }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
     if (!blob) throw new Error("conversion failed");
-    return new File([blob], "evidence.jpg", { type: "image/jpeg" });
-  } catch {
+    return new File([blob], file.name ? file.name.replace(/\.[^/.]+$/, "") + ".jpg" : "evidence.jpg", {
+      type: "image/jpeg",
+    });
+  } catch (err) {
+    console.error("normalizeImage error:", err);
+    if (SUPPORTED_TYPES.includes(file.type) && file.size <= 1.5 * 1024 * 1024) {
+      return file;
+    }
     throw new Error("SYSTEM: couldn't read that image. Try a JPG, PNG, or WEBP instead.");
   }
 }

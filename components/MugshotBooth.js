@@ -93,8 +93,13 @@ export default function MugshotBooth({ onCapture, onClose }) {
     setFlash(true);
     setTimeout(() => setFlash(false), 200);
 
-    const width = video.videoWidth || 640;
-    const height = video.videoHeight || 480;
+    const rawW = video.videoWidth || 640;
+    const rawH = video.videoHeight || 480;
+    const maxDim = 800;
+    const scale = Math.min(1, maxDim / Math.max(rawW, rawH));
+    const width = Math.round(rawW * scale);
+    const height = Math.round(rawH * scale);
+
     canvas.width = width;
     canvas.height = height;
 
@@ -116,7 +121,7 @@ export default function MugshotBooth({ onCapture, onClose }) {
         stopCamera();
       },
       "image/jpeg",
-      0.92
+      0.82
     );
   };
 

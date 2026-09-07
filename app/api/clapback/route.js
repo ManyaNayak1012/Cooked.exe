@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 export async function POST(req) {
   const apiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;

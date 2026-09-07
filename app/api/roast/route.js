@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 const SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
@@ -235,7 +236,8 @@ async function callGroq({
   userText,
   imageBlock,
   imageBlock2,
-  jsonMode = false,
+  jsonMode = true,
+  maxTokens = 900,
 }) {
   const messages = [];
 
@@ -284,7 +286,7 @@ async function callGroq({
     model,
     messages,
     temperature: 0.7,
-    max_tokens: 750,
+    max_tokens: maxTokens,
   };
 
   if (jsonMode) {
@@ -318,20 +320,26 @@ async function repairRoastJson({ apiKey, rawText, userMode }) {
 
   const repairModel = process.env.GROQ_MODEL || "qwen/qwen3.8-27b";
 
-  const response = await callGroq({
-    apiKey,
-    model: repairModel,
-    systemPrompt: "Return valid JSON only. Never use markdown fences.",
-    userText: repairPrompt,
-    imageBlock: null,
-    imageBlock2: null,
-    jsonMode: false,
-  });
+  try {
+    const response = await callGroq({
+      apiKey,
+      model: repairModel,
+      systemPrompt: "Return valid raw JSON only. Never use markdown fences.",
+      userText: repairPrompt,
+      imageBlock: null,
+      imageBlock2: null,
+      jsonMode: true,
+      maxTokens: 900,
+    });
 
-  if (!response.ok) return null;
-  const data = await response.json();
-  const text = data.choices?.[0]?.message?.content || "";
-  return safeParseJson(text);
+    if (!response.ok) return null;
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content || "";
+    return safeParseJson(text);
+  } catch (err) {
+    console.error("repairRoastJson failed:", err);
+    return null;
+  }
 }
 
 export async function POST(req) {
@@ -475,126 +483,167 @@ For Spotify, prioritize music-personality diagnostics; for selfies, prioritize s
 Raw JSON only.`;
 
   const hasImages = Boolean(imageBlock || imageBlock2);
-  const defaultTextModel = "qwen/qwen3.8-27b";
   const defaultVisionModel = "qwen/qwen3.8-27b";
+  const fallbackVisionModel = "qwen/qwen3.6-27b";
+  const defaultTextModel = "qwen/qwen3.8-27b";
+  const fallbackTextModel = "openai/gpt-oss-120b";
 
-  const model = hasImages
-    ? (process.env.GROQ_VISION_MODEL || process.env.GROQ_MODEL || defaultVisionModel)
-    : (process.env.GROQ_MODEL || defaultTextModel);
+  // When images are supplied, ONLY use vision-capable models (never fall back to text-only GROQ_MODEL)
+  const candidateModels = hasImages
+    ? [process.env.GROQ_VISION_MODEL || defaultVisionModel, fallbackVisionModel].filter(
+        (m, idx, arr) => m && arr.indexOf(m) === idx
+      )
+    : [process.env.GROQ_MODEL || defaultTextModel, fallbackTextModel].filter(
+        (m, idx, arr) => m && arr.indexOf(m) === idx
+      );
+
+  let parsed = null;
   let lastError = null;
+  let lastStatus = 502;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      let response = await callGroq({
-        apiKey,
-        model,
-        systemPrompt: SYSTEM_PROMPT,
-        userText,
-        imageBlock,
-        imageBlock2,
-        jsonMode: false,
-      });
+  for (const currentModel of candidateModels) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await callGroq({
+          apiKey,
+          model: currentModel,
+          systemPrompt: SYSTEM_PROMPT,
+          userText,
+          imageBlock,
+          imageBlock2,
+          jsonMode: true,
+          maxTokens: 900,
+        });
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        console.error("Groq API error:", response.status, errorBody);
+        if (!response.ok) {
+          const errorBody = await response.text();
+          console.error(`Groq API error (${currentModel}, attempt ${attempt + 1}):`, response.status, errorBody);
 
-        let detail = "";
-        try {
-          detail = JSON.parse(errorBody)?.error?.message || "";
-        } catch {}
+          let detail = "";
+          try {
+            detail = JSON.parse(errorBody)?.error?.message || "";
+          } catch {}
 
-        lastError = detail
-          ? `Groq ${response.status}: ${detail}`
-          : `Groq API returned HTTP ${response.status}`;
+          lastStatus = response.status;
+          lastError = detail
+            ? `Groq ${response.status}: ${detail}`
+            : `Groq API returned HTTP ${response.status}`;
 
-        if (response.status === 429 || response.status >= 500) continue;
+          // On 429 rate limit or 5xx server errors, jump immediately to fallback model
+          if (response.status === 429 || response.status >= 500) {
+            break;
+          }
+          break;
+        }
+
+        const data = await response.json();
+        const choice = data.choices?.[0];
+        const rawText = choice?.message?.content || "";
+
+        if (!rawText) {
+          lastError = `Groq returned no text (${choice?.finish_reason || "unknown reason"})`;
+          continue;
+        }
+
+        parsed = safeParseJson(rawText);
+
+        if (!parsed || !Array.isArray(parsed.lines) || parsed.lines.length === 0) {
+          parsed = await repairRoastJson({ apiKey, rawText, userMode });
+        }
+
+        if (!parsed || !Array.isArray(parsed.lines) || parsed.lines.length === 0) {
+          lastError = "Groq returned invalid roast JSON";
+          continue;
+        }
+
+        // Successfully received and parsed valid roast JSON
         break;
+      } catch (e) {
+        console.error(`Roast request failed for ${currentModel}:`, e);
+        lastError =
+          e?.name === "AbortError"
+            ? "Groq request timed out"
+            : e?.message || "Unknown server error";
+        if (e?.name === "AbortError") {
+          lastStatus = 504;
+        }
       }
+    }
 
-      const data = await response.json();
-      const choice = data.choices?.[0];
-      const rawText = choice?.message?.content || "";
-
-      if (!rawText) {
-        lastError = `Groq returned no text (${choice?.finish_reason || "unknown reason"})`;
-        continue;
-      }
-
-      let parsed = safeParseJson(rawText);
-
-      if (!parsed || !Array.isArray(parsed.lines) || parsed.lines.length === 0) {
-        parsed = await repairRoastJson({ apiKey, rawText, userMode });
-      }
-
-      if (!parsed || !Array.isArray(parsed.lines) || parsed.lines.length === 0) {
-        lastError = "Groq returned invalid roast JSON";
-        continue;
-      }
-
-      const maxLines = userMode === "duo" ? 6 : 5;
-      const lines = parsed.lines
-        .filter((line) => typeof line === "string" && line.trim())
-        .map((line) => line.trim())
-        .slice(0, maxLines);
-
-      if (!lines.length) {
-        lastError = "Groq returned an empty roast";
-        continue;
-      }
-
-      return NextResponse.json({
-        lines,
-        score: Math.min(100, Math.max(0, Math.round(Number(parsed.score) || 50))),
-        verdict:
-          typeof parsed.verdict === "string"
-            ? parsed.verdict.slice(0, 60)
-            : "UNDER REVIEW",
-        summary:
-          typeof parsed.summary === "string"
-            ? parsed.summary.slice(0, 180)
-            : "The evidence was suspiciously roastable.",
-        archetype:
-          typeof parsed.archetype === "string"
-            ? parsed.archetype.slice(0, 50)
-            : "THE UNFORTUNATE MAIN CHARACTER",
-        archetypeReason:
-          typeof parsed.archetypeReason === "string"
-            ? parsed.archetypeReason.slice(0, 140)
-            : "The evidence suggests several highly questionable decisions.",
-        fatality:
-          typeof parsed.fatality === "string"
-            ? parsed.fatality.slice(0, 180)
-            : lines[lines.length - 1],
-        winner:
-          userMode === "duo" &&
-          ["PLAYER 01", "PLAYER 02", "DRAW"].includes(parsed.winner)
-            ? parsed.winner
-            : undefined,
-        vibeStats: normalizeVibeStats(parsed.vibeStats),
-        friendVibeStats:
-          userMode === "duo" ? normalizeVibeStats(parsed.friendVibeStats) : undefined,
-        celebrityTwin: normalizeCelebrityTwin(parsed.celebrityTwin),
-        characterSheet: normalizeCharacterSheet(parsed.characterSheet),
-        photoAnnotations: normalizePhotoAnnotations(parsed.photoAnnotations),
-      });
-    } catch (e) {
-      console.error("Roast request failed:", e);
-      lastError =
-        e?.name === "AbortError"
-          ? "Groq request timed out"
-          : e?.message || "Unknown server error";
+    if (parsed && Array.isArray(parsed.lines) && parsed.lines.length > 0) {
+      break;
     }
   }
 
-  const isDev = process.env.NODE_ENV !== "production";
+  if (!parsed || !Array.isArray(parsed.lines) || parsed.lines.length === 0) {
+    const isDev = process.env.NODE_ENV !== "production";
+    const isRateLimit = lastStatus === 429 || /rate limit|tpm|token/i.test(lastError || "");
+    const isTimeout = lastStatus === 504 || /timed out/i.test(lastError || "");
 
-  return NextResponse.json(
-    {
-      error: isDev
-        ? `SYSTEM ERROR: Groq could not generate the roast. ${lastError || ""}`.trim()
-        : "SYSTEM ERROR: the roast machine choked. Try again in a moment.",
-    },
-    { status: 502 }
-  );
+    let userErrorMessage = "SYSTEM ERROR: The roast machine choked. Try again in a moment.";
+    if (isRateLimit) {
+      userErrorMessage = "ROAST.EXE COOLDOWN: Free tier rate limit reached. Please wait 15-30 seconds before your next roast.";
+    } else if (isTimeout) {
+      userErrorMessage = "ROAST.EXE TIMEOUT: Image processing took too long. Try smaller photos.";
+    } else if (isDev && lastError) {
+      userErrorMessage = `SYSTEM ERROR: ${lastError}`;
+    }
+
+    return NextResponse.json(
+      {
+        error: userErrorMessage,
+        detail: isDev ? lastError : undefined,
+      },
+      { status: isRateLimit ? 429 : lastStatus || 502 }
+    );
+  }
+
+  const maxLines = userMode === "duo" ? 6 : 5;
+  const lines = parsed.lines
+    .filter((line) => typeof line === "string" && line.trim())
+    .map((line) => line.trim())
+    .slice(0, maxLines);
+
+  if (!lines.length) {
+    return NextResponse.json(
+      { error: "SYSTEM ERROR: Groq returned an empty roast. Try again." },
+      { status: 502 }
+    );
+  }
+
+  return NextResponse.json({
+    lines,
+    score: Math.min(100, Math.max(0, Math.round(Number(parsed.score) || 50))),
+    verdict:
+      typeof parsed.verdict === "string"
+        ? parsed.verdict.slice(0, 60)
+        : "UNDER REVIEW",
+    summary:
+      typeof parsed.summary === "string"
+        ? parsed.summary.slice(0, 180)
+        : "The evidence was suspiciously roastable.",
+    archetype:
+      typeof parsed.archetype === "string"
+        ? parsed.archetype.slice(0, 50)
+        : "THE UNFORTUNATE MAIN CHARACTER",
+    archetypeReason:
+      typeof parsed.archetypeReason === "string"
+        ? parsed.archetypeReason.slice(0, 140)
+        : "The evidence suggests several highly questionable decisions.",
+    fatality:
+      typeof parsed.fatality === "string"
+        ? parsed.fatality.slice(0, 180)
+        : lines[lines.length - 1],
+    winner:
+      userMode === "duo" &&
+      ["PLAYER 01", "PLAYER 02", "DRAW"].includes(parsed.winner)
+        ? parsed.winner
+        : undefined,
+    vibeStats: normalizeVibeStats(parsed.vibeStats),
+    friendVibeStats:
+      userMode === "duo" ? normalizeVibeStats(parsed.friendVibeStats) : undefined,
+    celebrityTwin: normalizeCelebrityTwin(parsed.celebrityTwin),
+    characterSheet: normalizeCharacterSheet(parsed.characterSheet),
+    photoAnnotations: normalizePhotoAnnotations(parsed.photoAnnotations),
+  });
 }
